@@ -43,6 +43,11 @@ const TERMINES = new Set(['completed', 'failed', 'killed'])
 const OUTIL_COMPACTER = 'mcp__modeles__compacter'
 // Le temps de laisser le tour finir avant de compacter : $.session.compact rejette tant qu'un tour tourne.
 const DELAI_COMPACTAGE_MS = 1500
+// Après un essai manqué : un nouvel essai toutes les 5 s, 6 essais de suite au plus.
+const DELAI_NOUVEL_ESSAI_MS = 5000
+const ESSAIS_MAX = 6
+// Les statuts d'agent qui bloquent le compactage ; un coéquipier `idle` n'en fait pas partie.
+const EN_ROUTE = new Set(['pending', 'running', 'waiting'])
 const CONSIGNE_COMPACTAGE = `Garde les décisions prises, les fichiers touchés, l'état du travail, ce qui reste à faire et les consignes de l'utilisateur encore valables.`
 const NIVEAUX: readonly Effort[] = ['low', 'medium', 'high', 'xhigh', 'max']
 
@@ -259,6 +264,13 @@ let rappelEnAttente: string | undefined
 // Ce que le cerveau veut que le résumé garde ; le compactage se fait entre deux tours.
 let compactageDemande: string | undefined
 let minuterie: Timer | undefined
+// Pourquoi le dernier essai de compactage n'a pas passé ; vide s'il n'y en a pas.
+let attenteCompactage: string | undefined
+let essaisCompactage = 0
+// Vrai quand cette session refuse $.session.compact (headless) : le compactage passe par /compact.
+let parCommande = false
+// Le hook session.compact a noté le compactage en cours.
+let noteFaite = false
 const equipeIds = new Set<string>()
 const nomsEquipe = new Map<string, string>()
 const requetes = new Map<string, number>()
@@ -308,6 +320,27 @@ const modeManager = async ($: Session) =>
 
 type Compactage = 'fait' | 'attente' | { refus: string }
 
+// Un compactage du fil principal est fait : les seuils se réarment, il est compté et annoncé.
+const noterCompactage = async ($: EngineInterface, avant?: number, apres?: number) => {
+  noteFaite = true
+  conseilsDonnes.clear()
+  rappelEnAttente = undefined
+  await update($, stats, old => ({ ...old, compactages: old.compactages + 1 }))
+  $.ui.toast(
+    avant !== undefined && apres !== undefined
+      ? `Conversation compactée : ${k(avant)} → ${k(apres)} tokens.`
+      : 'Conversation compactée.',
+  )
+}
+
+// Garde la raison de l'attente ; un toast part quand elle change.
+const attendre = ($: EngineInterface, raison: string): 'attente' => {
+  if (raison !== attenteCompactage) $.ui.toast(`Compactage en attente : ${raison}`)
+  attenteCompactage = raison
+
+  return 'attente'
+}
+
 // Compacte la conversation si le cerveau l'a demandé, sans agent en route et entre deux tours.
 // Une demande qui ne peut pas passer reste en attente, pour un autre essai.
 const compacter = async ($: EngineInterface): Promise<Compactage | undefined> => {
@@ -315,38 +348,63 @@ const compacter = async ($: EngineInterface): Promise<Compactage | undefined> =>
   if (instructions === undefined) return undefined
 
   try {
-    if ((await $.agent.list()).some(a => !TERMINES.has(a.status))) return 'attente'
+    const enRoute = (await $.agent.list()).filter(a => EN_ROUTE.has(a.status))
+    if (enRoute.length > 0) {
+      const liste = enRoute.slice(0, 3).map(a => `${a.type} ${a.status}`).join(', ')
+
+      return attendre($, `${enRoute.length} agent(s) encore en route (${liste})`)
+    }
   } catch {}
 
+  noteFaite = false
+  let r: { skip?: string; tokensBefore?: number; tokensAfter?: number } | undefined
   try {
-    const r = await $.session.compact({ instructions })
-    compactageDemande = undefined
-    if (r.skip !== undefined) {
-      $.ui.toast(`Compactage non fait : ${r.skip}`)
-
-      return { refus: r.skip }
+    if (!parCommande) {
+      try {
+        r = await $.session.compact({ instructions })
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        if (!/headless/i.test(message)) return attendre($, message.slice(0, 200))
+        // Session lancée par un programme : l'appel direct n'existe pas, on passe par /compact.
+        parCommande = true
+      }
     }
-    conseilsDonnes.clear()
-    rappelEnAttente = undefined
-    await update($, stats, old => ({ ...old, compactages: old.compactages + 1 }))
-    $.ui.toast(
-      r.tokensBefore !== undefined && r.tokensAfter !== undefined
-        ? `Conversation compactée : ${k(r.tokensBefore)} → ${k(r.tokensAfter)} tokens.`
-        : 'Conversation compactée.',
-    )
-
-    return 'fait'
-  } catch {
-    return 'attente'
+    if (parCommande) {
+      await $.command.run({ command: 'compact', args: instructions.replace(/\s+/g, ' ').trim() })
+    }
+  } catch (err) {
+    return attendre($, (err instanceof Error ? err.message : String(err)).slice(0, 200))
   }
+
+  compactageDemande = undefined
+  attenteCompactage = undefined
+  essaisCompactage = 0
+  if (r?.skip !== undefined) {
+    $.ui.toast(`Compactage non fait : ${r.skip}`)
+
+    return { refus: r.skip }
+  }
+  if (!noteFaite) await noterCompactage($, r?.tokensBefore, r?.tokensAfter)
+
+  return 'fait'
 }
 
-// Pose la minuterie du compactage, s'il n'y en a pas déjà une.
-const planifierCompactage = ($: EngineInterface) => {
+const etatCompactage = () =>
+  compactageDemande === undefined
+    ? ''
+    : attenteCompactage === undefined
+      ? ' Compactage demandé.'
+      : ` Compactage demandé, en attente : ${attenteCompactage}.`
+
+// Pose la minuterie du compactage, s'il n'y en a pas déjà une. Un essai manqué en replanifie un,
+// ESSAIS_MAX fois de suite ; ensuite la fin du tour suivant relance.
+const planifierCompactage = ($: EngineInterface, delai = DELAI_COMPACTAGE_MS) => {
   if (minuterie !== undefined) return
-  minuterie = $.clock.after(DELAI_COMPACTAGE_MS, async () => {
+  minuterie = $.clock.after(delai, async () => {
     minuterie = undefined
-    await compacter($)
+    essaisCompactage++
+    const r = await compacter($)
+    if (r === 'attente' && essaisCompactage < ESSAIS_MAX) planifierCompactage($, DELAI_NOUVEL_ESSAI_MS)
   })
 }
 
@@ -355,6 +413,9 @@ export const register: Register = on => {
     conseilsDonnes.clear()
     rappelEnAttente = undefined
     compactageDemande = undefined
+    attenteCompactage = undefined
+    essaisCompactage = 0
+    parCommande = false
     minuterie?.cancel()
     minuterie = undefined
     interactive = e.isInteractive || e.surface !== null
@@ -492,6 +553,15 @@ export const register: Register = on => {
     return next({ ...e, context: [...(e.context ?? []), rappel] })
   })
 
+  on('session.compact', async ($, e, next) => {
+    const r = await next(e)
+    if (e.agentId === undefined && e.trigger !== 'precompute' && r.skip === undefined) {
+      await noterCompactage($, r.tokensBefore, r.tokensAfter)
+    }
+
+    return r
+  })
+
   on('tool.call', async ($, e, next) => {
     if (e.tool === OUTIL_COMPACTER) {
       if (e.agentId !== undefined) return { deny: 'Le compactage se demande depuis le fil principal.' }
@@ -500,6 +570,7 @@ export const register: Register = on => {
         return { deny: 'Dis dans a_garder ce que le résumé doit conserver : décisions, fichiers touchés, état du travail, reste à faire.' }
       }
       compactageDemande = aGarder
+      essaisCompactage = 0
 
       return { result: "Compactage noté : il se fera à la fin de ce tour, quand aucun agent ne tournera. Termine ta réponse à l'utilisateur et ne lance plus d'agent." }
     }
@@ -679,6 +750,7 @@ export const register: Register = on => {
     // Le tour du cerveau est fini : le compactage peut passer, un peu plus tard. Une demande
     // restée en attente est retentée à la fin du tour suivant.
     if (e.agentId === undefined && compactageDemande !== undefined && e.reason === 'answer') {
+      essaisCompactage = 0
       planifierCompactage($)
     }
 
@@ -708,6 +780,7 @@ export const register: Register = on => {
     const demande = /^compacter(?:\s+([\s\S]*))?$/i.exec(e.args.trim())
     if (demande) {
       compactageDemande = demande[1]?.trim() || CONSIGNE_COMPACTAGE
+      essaisCompactage = 0
       // Le moteur refuse $.session.compact depuis un hook de commande : la minuterie le lance après.
       planifierCompactage($)
 
@@ -745,7 +818,7 @@ export const register: Register = on => {
         `${texteStats(s)} (${s.alleges} allégé(s), ${s.sansModele} appel(s) refusé(s) faute de modèle, ${s.blocages} appel(s) direct(s) refusé(s)).`,
         `Agents de l'équipe : ${s.avertis} avertissement(s), ${s.arretes} arrêt(s). Seuils : ${REQUETES_AVERTISSEMENT_AGENT} puis ${REQUETES_MAX_AGENT} requêtes ; pour Haiku, ${milliers(CONTEXTE_AVERTISSEMENT_HAIKU)} puis ${milliers(CONTEXTE_MAX_HAIKU)} tokens de contexte.`,
         `${texteTokens(s)}.`,
-        `Contexte : ${s.compactages} compactage(s) ; rappel au cerveau à ${milliers(SEUIL_BAS)} puis ${milliers(SEUIL_HAUT)} tokens.`,
+        `Contexte : ${s.compactages} compactage(s) ; rappel au cerveau à ${milliers(SEUIL_BAS)} puis ${milliers(SEUIL_HAUT)} tokens.${etatCompactage()}`,
         texteCache(s),
         ...(await texteForfait($)),
       ]

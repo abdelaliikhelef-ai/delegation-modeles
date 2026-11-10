@@ -54,7 +54,9 @@ Un `general-purpose` ou un `Explore` dont la consigne ne nomme ni MCP ni skill e
 
 Quand le contexte du fil principal dépasse 250 000 tokens, puis 500 000, le mod prévient. L'utilisateur reçoit un message. Le cerveau reçoit un rappel avec son prochain prompt (sauf si c'est une commande slash, le rappel attend alors le prompt suivant).
 
-Quand sa tâche est finie, le cerveau appelle l'outil `mcp__modeles__compacter` et dit ce que le résumé doit garder. Le compactage se fait à la fin du tour, quand aucun agent ne tourne. S'il ne peut pas passer, il est retenté à la fin du tour suivant.
+Quand sa tâche est finie, le cerveau appelle l'outil `mcp__modeles__compacter` et dit ce que le résumé doit garder. Le compactage se fait à la fin du tour, quand aucun agent ne tourne. S'il ne peut pas passer, le mod affiche la raison et réessaie toutes les 5 secondes (6 fois), puis à la fin du tour suivant. `/delegation` montre une demande en attente.
+
+Dans l'application de bureau, le mod passe par la commande `/compact`. Un `/compact` tapé à la main ou un compactage automatique réarment aussi les seuils.
 
 Un compactage est un résumé : il peut perdre un détail. Les décisions durables vont donc en mémoire avant.
 

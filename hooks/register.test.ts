@@ -1,5 +1,7 @@
 import { expect, mock, test as testBase } from 'claude-code/testing'
 
+import { register } from './register'
+
 // Par défaut, la session principale tourne sur Opus ; un test change `modele.nom` pour répondre autrement.
 const modele = { nom: 'opus' }
 const test: typeof testBase = ((nom: string, fn: any) =>
@@ -858,13 +860,22 @@ const finDeTour = ($: any, champs: Record<string, unknown> = {}) =>
 
 // Le décor commun : session démarrée, horloge simulée, compactage réussi (300k -> 40k) ; renvoie les appels à compact.
 const agents = { liste: [] as { id: string; type: string; status: string }[] }
+const commandes: { command: string; args?: string }[] = []
+const commande = { echec: undefined as string | undefined }
 const decorCompactage = async ($: any, on: any, resultat: () => unknown = () => ({ messages: RESUME, tokensBefore: 300_000, tokensAfter: 40_000 }), usage?: Record<string, number>) => {
   agents.liste = []
+  commandes.length = 0
+  commande.echec = undefined
   const vus = preparer(on, usage)
   const compactages: { instructions?: string }[] = []
   const horloge = mock.clock(on)
   on('turn.complete', () => ({ text: '' }))
   on('agent.list', () => ({ value: agents.liste }) as any)
+  on('command.run', { command: 'compact' }, (_: unknown, e: { command: string; args?: string }) => {
+    commandes.push({ command: e.command, args: e.args })
+    if (commande.echec !== undefined) throw new Error(commande.echec)
+    return { text: '' }
+  })
   on('prompt.submit', (_: unknown, e: { text: string; context?: string[] }) => ({ text: e.text, context: e.context }))
   on('session.compact', (_: unknown, e: { instructions?: string }) => {
     compactages.push({ instructions: e.instructions })
@@ -931,34 +942,83 @@ test('un tour interrompu ne déclenche pas le compactage', async ($, on) => {
   expect(compactages).toEqual([])
 })
 
-test('un agent encore en route retarde le compactage, qui se fait à la fin du tour suivant', async ($, on) => {
+const NOUVEL_ESSAI = 5000
+const rejetUneFois = (etat: { echec: boolean }) => () => {
+  if (etat.echec) throw new Error('tour en cours')
+  return { messages: RESUME, tokensBefore: 300_000, tokensAfter: 40_000 }
+}
+
+for (const statut of ['running', 'pending', 'waiting']) {
+  test(`un agent ${statut} retarde le compactage, qui se fait dès qu'il a fini`, async ($, on) => {
+    const { vus, compactages, horloge } = await decorCompactage($, on)
+    agents.liste = [{ id: 'a1', type: 'modeles:explorateur', status: statut }]
+    await demander($)
+    await finDeTour($)
+    await horloge.advance(DELAI)
+    expect(compactages).toEqual([])
+    expect(vus).toContain(`Compactage en attente : 1 agent(s) encore en route (modeles:explorateur ${statut})`)
+    agents.liste[0]!.status = 'completed'
+    await horloge.advance(NOUVEL_ESSAI)
+    expect(compactages).toHaveLength(1)
+  })
+}
+
+test('un agent idle ne bloque pas le compactage', async ($, on) => {
   const { compactages, horloge } = await decorCompactage($, on)
-  agents.liste = [{ id: 'a1', type: 'general-purpose', status: 'running' }]
+  agents.liste = [{ id: 'a1', type: 'general-purpose', status: 'idle' }]
   await demander($)
-  await finDeTour($)
-  await horloge.advance(DELAI)
-  expect(compactages).toEqual([])
-  agents.liste[0]!.status = 'completed'
   await finDeTour($)
   await horloge.advance(DELAI)
   expect(compactages).toHaveLength(1)
 })
 
-test('si le compactage échoue, la demande reste et il est retenté à la fin du tour suivant', async ($, on) => {
-  let echec = true
-  const { compactages, horloge } = await decorCompactage($, on, () => {
-    if (echec) throw new Error('tour en cours')
-    return { messages: RESUME, tokensBefore: 300_000, tokensAfter: 40_000 }
-  })
+test('l’attente d’un agent n’est annoncée qu’une fois sur plusieurs essais de suite', async ($, on) => {
+  const { vus, horloge } = await decorCompactage($, on)
+  agents.liste = [{ id: 'a1', type: 'modeles:explorateur', status: 'running' }]
+  await demander($)
+  await finDeTour($)
+  await horloge.advance(DELAI)
+  await horloge.advance(NOUVEL_ESSAI)
+  await horloge.advance(NOUVEL_ESSAI)
+  expect(vus.filter(t => t.startsWith('Compactage en attente'))).toHaveLength(1)
+})
+
+test('si le compactage est rejeté, le toast donne l’erreur, un essai a lieu toutes les 5 s, 6 au plus, puis la fin du tour relance', async ($, on) => {
+  const etat = { echec: true }
+  const { vus, compactages, horloge } = await decorCompactage($, on, rejetUneFois(etat))
   await demander($)
   await finDeTour($)
   await horloge.advance(DELAI)
   expect(compactages).toHaveLength(1)
-  echec = false
+  // Le kit met l'erreur du hook sous son propre message ; le toast reprend celui que le moteur renvoie.
+  expect(vus.filter(t => t.startsWith('Compactage en attente : ') && t.length > 25)).toHaveLength(1)
+  await horloge.advance(NOUVEL_ESSAI - 1)
+  expect(compactages).toHaveLength(1)
+  await horloge.advance(1)
+  expect(compactages).toHaveLength(2)
+  await horloge.advance(NOUVEL_ESSAI * 10)
+  expect(compactages).toHaveLength(6)
+  expect(vus.filter(t => t.startsWith('Compactage en attente'))).toHaveLength(1)
+  etat.echec = false
   await finDeTour($)
   await horloge.advance(DELAI)
-  expect(compactages).toHaveLength(2)
-  expect(compactages[1]!.instructions).toBe(GARDE)
+  expect(compactages).toHaveLength(7)
+  expect(compactages[6]!.instructions).toBe(GARDE)
+})
+
+test('/delegation montre la demande en attente et sa raison, puis plus rien une fois compactée', async ($, on) => {
+  const etat = { echec: true }
+  const { horloge } = await decorCompactage($, on, rejetUneFois(etat))
+  const etatCtx = async () => ((await ($.command.run as any)({ command: 'delegation', args: '' })).text as string)
+  expect(await etatCtx()).not.toContain('Compactage demandé')
+  await demander($)
+  expect(await etatCtx()).toContain('tokens. Compactage demandé.')
+  await finDeTour($)
+  await horloge.advance(DELAI)
+  expect(await etatCtx()).toMatch(/Compactage demandé, en attente : .+\./)
+  etat.echec = false
+  await horloge.advance(NOUVEL_ESSAI)
+  expect(await etatCtx()).not.toContain('Compactage demandé')
 })
 
 test('sur skip, le toast donne la raison et aucun nouvel essai n’a lieu', async ($, on) => {
@@ -1013,7 +1073,7 @@ test('/delegation compacter avec un texte le passe tel quel, sans texte la consi
   expect(compactages[1]!.instructions).toContain('Garde les décisions prises')
 })
 
-test('/delegation compacter répond « noté » et lance le compactage 1 500 ms plus tard, retenté si rejeté', async ($, on) => {
+test('/delegation compacter répond « noté », lance le compactage 1 500 ms plus tard et le retente 5 s après un rejet', async ($, on) => {
   let echec = true
   const { compactages, horloge } = await decorCompactage($, on, () => {
     if (echec) throw new Error('tour en cours')
@@ -1025,8 +1085,7 @@ test('/delegation compacter répond « noté » et lance le compactage 1 500 ms 
   await horloge.advance(DELAI)
   expect(compactages).toHaveLength(1)
   echec = false
-  await finDeTour($)
-  await horloge.advance(DELAI)
+  await horloge.advance(NOUVEL_ESSAI)
   expect(compactages).toHaveLength(2)
 })
 
@@ -1036,4 +1095,156 @@ test('sur Sonnet, le mode manager est inactif : ni toast ni rappel au-delà de 2
   await consommer($, undefined, 1)
   expect(vus).toEqual([])
   expect(((await soumettre($)) as any).context ?? []).toEqual([])
+})
+
+// Le kit ne sait pas faire rejeter $.session.compact avec un message choisi (un hook qui lève est sauté) :
+// pour le repli headless, on pilote les hooks du module avec un `$` écrit à la main.
+const HEADLESS = '$.session.compact: not available in a headless (-p / SDK) session yet: compaction here runs inside a turn (a /compact prompt); catch it and carry on'
+
+const montage = (rejet: () => Error | undefined = () => new Error(HEADLESS)) => {
+  const hooks: Record<string, (...a: any[]) => Promise<any>> = {}
+  register(((nom: string, ...reste: any[]) => {
+    hooks[`${nom}${reste.length === 2 ? ':' + reste[0].command : ''}`] = reste[reste.length - 1]
+  }) as any, {} as any)
+  const etat = new Map<string, unknown>()
+  const toasts: string[] = []
+  const appels = { compact: 0, commandes: [] as any[], minuteries: [] as { ms: number; fn: () => Promise<void> }[] }
+  const commandeRejet = { message: undefined as string | undefined }
+  const $: any = {
+    state: {
+      get: async (ref: any) => ({ value: etat.get(JSON.stringify(ref)), version: 1 }),
+      set: async (ref: any, v: unknown) => {
+        etat.set(JSON.stringify(ref), v)
+        return { isSet: true, version: 2 }
+      },
+    },
+    ui: { toast: (t: string) => toasts.push(t), status: async () => undefined },
+    clock: {
+      now: async () => 0,
+      after: (ms: number, fn: () => Promise<void>) => {
+        const m = { ms, fn }
+        appels.minuteries.push(m)
+        return { cancel() {} }
+      },
+    },
+    agent: { list: async () => [], register: async () => ({}) },
+    session: {
+      model: async () => 'opus',
+      surfaces: async () => ['bureau'],
+      compact: async () => {
+        appels.compact++
+        const erreur = rejet()
+        if (erreur) throw erreur
+        return { messages: [], tokensBefore: 300_000, tokensAfter: 40_000 }
+      },
+    },
+    command: {
+      register: async () => ({}),
+      run: async (c: any) => {
+        appels.commandes.push(c)
+        if (commandeRejet.message !== undefined) throw new Error(commandeRejet.message)
+        return { text: '' }
+      },
+    },
+    tool: { register: async () => ({}) },
+    store: { get: async () => undefined, set: async () => undefined },
+  }
+  const suite = (e: any) => Promise.resolve({ text: '' })
+  const demarrer = () => hooks['session.start']!($, { cwd: '/', surface: 'bureau', isInteractive: true }, async (e: any) => e)
+  const demander = (a_garder: string) => hooks['tool.call']!($, { tool: 'mcp__modeles__compacter', a_garder }, suite)
+  const finDeTour = () => hooks['turn.complete']!($, { turnId: 't', answer: '', durationMs: 1, isAborted: false, reason: 'answer' }, suite)
+  const lancerMinuterie = async () => {
+    const m = appels.minuteries.shift()!
+    await m.fn()
+  }
+  const delegation = async () =>
+    ((await hooks['command.run:delegation']!($, { command: 'delegation', args: '' })).text as string)
+
+  return { $, hooks, toasts, appels, commandeRejet, demarrer, demander, finDeTour, lancerMinuterie, delegation }
+}
+
+testBase('rejet headless : repli par /compact sur une seule ligne, sans toast d’attente, demande vidée', async () => {
+  const m = montage()
+  await m.demarrer()
+  await m.demander('Garde le plan\net  les fichiers')
+  await m.finDeTour()
+  await m.lancerMinuterie()
+  expect(m.appels.commandes).toEqual([{ command: 'compact', args: 'Garde le plan et les fichiers' }])
+  expect(m.toasts.filter(t => t.startsWith('Compactage en attente'))).toEqual([])
+  expect(await m.delegation()).not.toContain('Compactage demandé')
+  expect(await m.delegation()).toContain('1 compactage(s)')
+})
+
+testBase('après un rejet headless, une nouvelle demande passe directement par /compact', async () => {
+  const m = montage()
+  await m.demarrer()
+  await m.demander('Un')
+  await m.finDeTour()
+  await m.lancerMinuterie()
+  expect(m.appels.compact).toBe(1)
+  await m.demander('Deux')
+  await m.finDeTour()
+  await m.lancerMinuterie()
+  expect(m.appels.compact).toBe(1)
+  expect(m.appels.commandes.map(c => c.args)).toEqual(['Un', 'Deux'])
+})
+
+testBase('si /compact rejette, le toast d’attente part et la demande reste', async () => {
+  const m = montage()
+  m.commandeRejet.message = 'limite atteinte'
+  await m.demarrer()
+  await m.demander('Un')
+  await m.finDeTour()
+  await m.lancerMinuterie()
+  expect(m.toasts).toContain('Compactage en attente : limite atteinte')
+  expect(await m.delegation()).toContain('Compactage demandé, en attente : limite atteinte.')
+})
+
+testBase('un rejet qui ne parle pas de headless garde l’attente et le nouvel essai', async () => {
+  const m = montage(() => new Error('tour en cours'))
+  await m.demarrer()
+  await m.demander('Un')
+  await m.finDeTour()
+  await m.lancerMinuterie()
+  expect(m.toasts).toContain('Compactage en attente : tour en cours')
+  expect(m.appels.commandes).toEqual([])
+  expect(m.appels.minuteries.map(x => x.ms)).toEqual([5000])
+})
+
+const compacterParMoteur = (m: ReturnType<typeof montage>, e: Record<string, unknown>, r: Record<string, unknown>) =>
+  m.hooks['session.compact']!(m.$, { messages: [], ...e }, async () => r)
+const RESULTAT = { messages: [], tokensBefore: 300_000, tokensAfter: 40_000 }
+
+testBase('un compactage du fil principal (/compact, automatique) est compté une fois et annoncé', async () => {
+  const m = montage()
+  await m.demarrer()
+  const r = await compacterParMoteur(m, { trigger: 'manual' }, RESULTAT)
+  expect(r).toBe(RESULTAT)
+  expect(m.toasts).toEqual(['Conversation compactée : 300k → 40k tokens.'])
+  expect(await m.delegation()).toContain('1 compactage(s)')
+})
+
+testBase('rien n’est compté pour precompute, pour un agent ni sur skip', async () => {
+  const m = montage()
+  await m.demarrer()
+  await compacterParMoteur(m, { trigger: 'precompute' }, RESULTAT)
+  await compacterParMoteur(m, { trigger: 'auto', agentId: 'a1' }, RESULTAT)
+  await compacterParMoteur(m, { trigger: 'manual' }, { skip: 'refusé' })
+  expect(m.toasts).toEqual([])
+  expect(await m.delegation()).toContain('0 compactage(s)')
+})
+
+testBase('un compactage direct du mod noté par le hook n’est pas compté deux fois', async () => {
+  const m = montage(() => undefined)
+  // Le moteur fait passer l'appel du mod par le hook du module.
+  m.$.session.compact = async () => {
+    m.appels.compact++
+    return compacterParMoteur(m, { trigger: 'plugin' }, RESULTAT)
+  }
+  await m.demarrer()
+  await m.demander('Un')
+  await m.finDeTour()
+  await m.lancerMinuterie()
+  expect(m.toasts).toEqual(['Conversation compactée : 300k → 40k tokens.'])
+  expect(await m.delegation()).toContain('1 compactage(s)')
 })
