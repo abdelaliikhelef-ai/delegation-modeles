@@ -16,6 +16,7 @@ export type Stats = {
   blocages: number
   arretes: number
   avertis: number
+  compactages: number
   tokens: { fable: number; opus: number; sonnet: number; haiku: number; autre: number }
   cache: { lus: number; ecrits: number; neufs: number }
 }

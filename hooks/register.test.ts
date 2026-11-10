@@ -602,31 +602,32 @@ test('un agent non identifiable garde ses injections MCP', async ($, on) => {
   expect((await attache($, 'mcp_instructions_delta', 'inconnu')).text).toBe('texte')
 })
 
-const CONSEIL_120 = 'Contexte au-delà de 120 000 tokens : pour un nouveau chantier, ouvre une nouvelle session.'
-const CONSEIL_200 =
-  'Contexte au-delà de 200 000 tokens : chaque requête relit tout. Termine ce chantier, puis ouvre une nouvelle session.'
+const toast = (seuil: string) =>
+  `Contexte au-delà de ${seuil} tokens : la conversation sera compactée dès que la tâche en cours sera terminée.`
+const CONSEIL_250 = toast('250 000')
+const CONSEIL_500 = toast('500 000')
 
-test('le conseil de nouvelle session s’affiche une seule fois à 120 000 tokens, puis une fois à 200 000', async ($, on) => {
-  const usage = { input_tokens: 10, cache_creation_input_tokens: 20_000, cache_read_input_tokens: 100_000 }
+test('le conseil de compactage s’affiche une seule fois à 250 000 tokens, puis une fois à 500 000', async ($, on) => {
+  const usage = { input_tokens: 10, cache_creation_input_tokens: 20_000, cache_read_input_tokens: 240_000 }
   const vus = preparer(on, usage)
   await consommer($, undefined, 3)
-  expect(vus).toEqual([CONSEIL_120])
-  usage.cache_read_input_tokens = 180_000
+  expect(vus).toEqual([CONSEIL_250])
+  usage.cache_read_input_tokens = 480_000
   await consommer($, undefined, 3)
-  expect(vus).toEqual([CONSEIL_120, CONSEIL_200])
+  expect(vus).toEqual([CONSEIL_250, CONSEIL_500])
 })
 
-test('une session déjà au-delà de 200 000 tokens ne reçoit que le conseil le plus haut', async ($, on) => {
-  const usage = { input_tokens: 10, cache_creation_input_tokens: 100_000, cache_read_input_tokens: 150_000 }
+test('une session déjà au-delà de 500 000 tokens ne reçoit que le conseil le plus haut', async ($, on) => {
+  const usage = { input_tokens: 10, cache_creation_input_tokens: 100_000, cache_read_input_tokens: 450_000 }
   const vus = preparer(on, usage)
   await consommer($, undefined, 2)
-  usage.cache_read_input_tokens = 30_000
+  usage.cache_read_input_tokens = 130_000
   await consommer($, undefined, 2)
-  expect(vus).toEqual([CONSEIL_200])
+  expect(vus).toEqual([CONSEIL_500])
 })
 
-test('pas de conseil sous 120 000 tokens', async ($, on) => {
-  const vus = preparer(on, { input_tokens: 10, cache_creation_input_tokens: 20_000, cache_read_input_tokens: 99_990 })
+test('pas de conseil sous 250 000 tokens', async ($, on) => {
+  const vus = preparer(on, { input_tokens: 10, cache_creation_input_tokens: 20_000, cache_read_input_tokens: 229_990 })
   await consommer($, undefined, 2)
   expect(vus).toEqual([])
 })
@@ -637,6 +638,7 @@ test('pas de conseil pour un sous-agent', async ($, on) => {
   expect(vus).toEqual([])
 })
 
+let outilEnregistre: any
 const demarrer = async ($: any, on: any, isInteractive: boolean, ecrans: string[] | 'erreur' = []) => {
   on('session.surfaces', () => {
     if (ecrans === 'erreur') throw new Error('lecture impossible')
@@ -644,6 +646,10 @@ const demarrer = async ($: any, on: any, isInteractive: boolean, ecrans: string[
   })
   on('session.start', (_: unknown, e: { cwd: string }) => ({ cwd: e.cwd }))
   on('command.register', () => ({ value: { command: 'delegation' } }))
+  on('tool.register', (_: unknown, e: unknown) => {
+    outilEnregistre = e
+    return { value: { tool: 'mcp__modeles__compacter' } }
+  })
   on('agent.register', (_: unknown, e: { name: string }) => ({ value: { agent: e.name } }))
   await $.session.start({ cwd: '/projet', surface: null, isInteractive })
 }
@@ -835,4 +841,199 @@ test('application de bureau sur Sonnet : aucune limite', async ($, on) => {
   modele.nom = 'claude-sonnet-5'
   await demarrer($, on, false, ['desktop'])
   expect((await gros($)).deny).toBeUndefined()
+})
+
+// --- Compactage demandé par le cerveau ---
+
+const OUTIL = 'mcp__modeles__compacter'
+const DELAI = 1500
+const USAGE_GROS = { input_tokens: 10, cache_creation_input_tokens: 20_000, cache_read_input_tokens: 280_000 }
+const RESUME = [{ role: 'user', text: 'Résumé', toolUses: [] }] as any
+const NOTE_ATTENTE = 'Compactage noté : il se fera dès que le tour en cours et les agents auront fini.'
+const GARDE = 'Garde le plan et les fichiers touchés'
+
+const demander = ($: any, a_garder: unknown = GARDE) => appelOutil($, { tool: OUTIL, a_garder })
+const finDeTour = ($: any, champs: Record<string, unknown> = {}) =>
+  $.turn.complete({ turnId: 't1', answer: '', durationMs: 1, isAborted: false, reason: 'answer', ...champs })
+
+// Le décor commun : session démarrée, horloge simulée, compactage réussi (300k -> 40k) ; renvoie les appels à compact.
+const agents = { liste: [] as { id: string; type: string; status: string }[] }
+const decorCompactage = async ($: any, on: any, resultat: () => unknown = () => ({ messages: RESUME, tokensBefore: 300_000, tokensAfter: 40_000 }), usage?: Record<string, number>) => {
+  agents.liste = []
+  const vus = preparer(on, usage)
+  const compactages: { instructions?: string }[] = []
+  const horloge = mock.clock(on)
+  on('turn.complete', () => ({ text: '' }))
+  on('agent.list', () => ({ value: agents.liste }) as any)
+  on('prompt.submit', (_: unknown, e: { text: string; context?: string[] }) => ({ text: e.text, context: e.context }))
+  on('session.compact', (_: unknown, e: { instructions?: string }) => {
+    compactages.push({ instructions: e.instructions })
+    return resultat() as any
+  })
+  await demarrer($, on, true)
+  return { vus, compactages, horloge }
+}
+
+const soumettre = async ($: any, champs: Record<string, unknown> = {}) =>
+  ($.prompt.submit as any)({ text: 'suite', wait: false, ...champs })
+
+test('session.start enregistre l’outil compacter, toujours chargé, avec a_garder obligatoire', async ($, on) => {
+  await decorCompactage($, on)
+  expect(outilEnregistre.name).toBe('compacter')
+  expect(outilEnregistre.isDeferred).toBe(false)
+  expect(outilEnregistre.inputSchema.required).toEqual(['a_garder'])
+})
+
+test('l’outil refuse un appel sans a_garder, un a_garder d’espaces et un appel venu d’un agent', async ($, on) => {
+  await decorCompactage($, on)
+  expect((await appelOutil($, { tool: OUTIL })).deny).toContain('a_garder')
+  expect((await demander($, '   \n ')).deny).toContain('a_garder')
+  expect((await appelOutil($, { tool: OUTIL, agentId: 'a1', a_garder: GARDE })).deny).toContain('fil principal')
+})
+
+test('l’outil accepte un appel correct', async ($, on) => {
+  await decorCompactage($, on)
+  const r = await demander($)
+  expect(r.deny).toBeUndefined()
+  expect(r.result).toContain('Compactage noté')
+})
+
+test('après une demande, la fin du tour puis 1 500 ms lancent le compactage et l’annoncent', async ($, on) => {
+  const { vus, compactages, horloge } = await decorCompactage($, on)
+  await demander($)
+  await finDeTour($)
+  await horloge.advance(DELAI)
+  expect(compactages).toEqual([{ instructions: GARDE }])
+  expect(vus).toContain('Conversation compactée : 300k → 40k tokens.')
+  expect(((await ($.command.run as any)({ command: 'delegation', args: '' })).text)).toContain('1 compactage(s)')
+})
+
+test('sans demande, rien n’est compacté', async ($, on) => {
+  const { compactages, horloge } = await decorCompactage($, on)
+  await finDeTour($)
+  await horloge.advance(DELAI * 2)
+  expect(compactages).toEqual([])
+})
+
+test('avant la fin du délai, rien n’est compacté', async ($, on) => {
+  const { compactages, horloge } = await decorCompactage($, on)
+  await demander($)
+  await finDeTour($)
+  await horloge.advance(DELAI - 1)
+  expect(compactages).toEqual([])
+})
+
+test('un tour interrompu ne déclenche pas le compactage', async ($, on) => {
+  const { compactages, horloge } = await decorCompactage($, on)
+  await demander($)
+  await finDeTour($, { reason: 'aborted', isAborted: true })
+  await horloge.advance(DELAI * 2)
+  expect(compactages).toEqual([])
+})
+
+test('un agent encore en route retarde le compactage, qui se fait à la fin du tour suivant', async ($, on) => {
+  const { compactages, horloge } = await decorCompactage($, on)
+  agents.liste = [{ id: 'a1', type: 'general-purpose', status: 'running' }]
+  await demander($)
+  await finDeTour($)
+  await horloge.advance(DELAI)
+  expect(compactages).toEqual([])
+  agents.liste[0]!.status = 'completed'
+  await finDeTour($)
+  await horloge.advance(DELAI)
+  expect(compactages).toHaveLength(1)
+})
+
+test('si le compactage échoue, la demande reste et il est retenté à la fin du tour suivant', async ($, on) => {
+  let echec = true
+  const { compactages, horloge } = await decorCompactage($, on, () => {
+    if (echec) throw new Error('tour en cours')
+    return { messages: RESUME, tokensBefore: 300_000, tokensAfter: 40_000 }
+  })
+  await demander($)
+  await finDeTour($)
+  await horloge.advance(DELAI)
+  expect(compactages).toHaveLength(1)
+  echec = false
+  await finDeTour($)
+  await horloge.advance(DELAI)
+  expect(compactages).toHaveLength(2)
+  expect(compactages[1]!.instructions).toBe(GARDE)
+})
+
+test('sur skip, le toast donne la raison et aucun nouvel essai n’a lieu', async ($, on) => {
+  const { vus, compactages, horloge } = await decorCompactage($, on, () => ({ skip: 'refusé' }))
+  await demander($)
+  await finDeTour($)
+  await horloge.advance(DELAI)
+  expect(vus).toContain('Compactage non fait : refusé')
+  await finDeTour($)
+  await horloge.advance(DELAI)
+  expect(compactages).toHaveLength(1)
+})
+
+test('au-delà de 250 000 tokens, le rappel part une fois avec le prompt suivant', async ($, on) => {
+  const { vus } = await decorCompactage($, on, undefined, USAGE_GROS)
+  await consommer($, undefined, 1)
+  expect(vus).toContain(CONSEIL_250)
+  const r: any = await soumettre($)
+  expect(r.context).toHaveLength(1)
+  expect(r.context[0]).toContain('dépasse 250 000 tokens')
+  expect(r.context[0]).toContain(OUTIL)
+  expect(((await soumettre($)) as any).context ?? []).toEqual([])
+})
+
+test('une commande slash ne consomme pas le rappel, le prompt suivant le reçoit', async ($, on) => {
+  await decorCompactage($, on, undefined, USAGE_GROS)
+  await consommer($, undefined, 1)
+  const commande: any = await soumettre($, { text: '/status', command: { name: 'status', args: '' } })
+  expect(commande.context ?? []).toEqual([])
+  const suivant: any = await soumettre($)
+  expect(suivant.context[0]).toContain('dépasse 250 000 tokens')
+})
+
+test('après un compactage réussi, un nouveau franchissement de 250 000 redonne le toast', async ($, on) => {
+  const { vus, horloge } = await decorCompactage($, on, undefined, USAGE_GROS)
+  await consommer($, undefined, 1)
+  await demander($)
+  await finDeTour($)
+  await horloge.advance(DELAI)
+  await consommer($, undefined, 1)
+  expect(vus.filter(t => t === CONSEIL_250)).toHaveLength(2)
+})
+
+test('/delegation compacter avec un texte le passe tel quel, sans texte la consigne par défaut', async ($, on) => {
+  const { compactages, horloge } = await decorCompactage($, on)
+  const r = await ($.command.run as any)({ command: 'delegation', args: 'compacter Garde le Plan B' })
+  expect(r.text).toBe(NOTE_ATTENTE)
+  await horloge.advance(DELAI)
+  await ($.command.run as any)({ command: 'delegation', args: 'compacter' })
+  await horloge.advance(DELAI)
+  expect(compactages[0]!.instructions).toBe('Garde le Plan B')
+  expect(compactages[1]!.instructions).toContain('Garde les décisions prises')
+})
+
+test('/delegation compacter répond « noté » et lance le compactage 1 500 ms plus tard, retenté si rejeté', async ($, on) => {
+  let echec = true
+  const { compactages, horloge } = await decorCompactage($, on, () => {
+    if (echec) throw new Error('tour en cours')
+    return { messages: RESUME, tokensBefore: 300_000, tokensAfter: 40_000 }
+  })
+  const r = await ($.command.run as any)({ command: 'delegation', args: 'compacter' })
+  expect(r.text).toBe(NOTE_ATTENTE)
+  expect(compactages).toHaveLength(0)
+  await horloge.advance(DELAI)
+  expect(compactages).toHaveLength(1)
+  echec = false
+  await finDeTour($)
+  await horloge.advance(DELAI)
+  expect(compactages).toHaveLength(2)
+})
+
+test('sur Sonnet, le mode manager est inactif : ni toast ni rappel au-delà de 250 000 tokens', async ($, on) => {
+  modele.nom = 'claude-sonnet-5'
+  const { vus } = await decorCompactage($, on, undefined, USAGE_GROS)
+  await consommer($, undefined, 1)
+  expect(vus).toEqual([])
+  expect(((await soumettre($)) as any).context ?? []).toEqual([])
 })

@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { Register } from 'claude-code'
+import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import type { Effort, EffortCerveau, Famille, Fils, Stats } from '../types'
 
@@ -15,12 +15,13 @@ const VIDE: Stats = {
   blocages: 0,
   arretes: 0,
   avertis: 0,
+  compactages: 0,
   tokens: { fable: 0, opus: 0, sonnet: 0, haiku: 0, autre: 0 },
   cache: { lus: 0, ecrits: 0, neufs: 0 },
 }
 
 const stats = atom({ plugin: 'modeles', key: 'stats' } as const, VIDE, {
-  shape: 'stats-6',
+  shape: 'stats-7',
 })
 const actif = atom({ plugin: 'modeles', key: 'actif' } as const, true, {
   shape: 'actif-1',
@@ -39,6 +40,10 @@ const cerveau = atom({ plugin: 'modeles', key: 'cerveau' } as const, EFFORT_CERV
 const NOMS: Record<Famille, string> = { fable: 'Fable', opus: 'Opus', sonnet: 'Sonnet', haiku: 'Haiku' }
 const PRINCIPAL = 'principal'
 const TERMINES = new Set(['completed', 'failed', 'killed'])
+const OUTIL_COMPACTER = 'mcp__modeles__compacter'
+// Le temps de laisser le tour finir avant de compacter : $.session.compact rejette tant qu'un tour tourne.
+const DELAI_COMPACTAGE_MS = 1500
+const CONSIGNE_COMPACTAGE = `Garde les décisions prises, les fichiers touchés, l'état du travail, ce qui reste à faire et les consignes de l'utilisateur encore valables.`
 const NIVEAUX: readonly Effort[] = ['low', 'medium', 'high', 'xhigh', 'max']
 
 let dernierTexte: string | undefined
@@ -73,11 +78,18 @@ const ECRITURE_LIBRE = /\/\.claude\/|^\/private\/tmp\/|^\/tmp\//
 
 const milliers = (n: number) => `${Math.round(n / 1000)} 000`
 
-// Conseils de nouvelle session, du seuil le plus haut au plus bas ; chacun une seule fois par session.
-const CONSEILS: readonly (readonly [number, string])[] = [
-  [200_000, `Contexte au-delà de ${milliers(200_000)} tokens : chaque requête relit tout. Termine ce chantier, puis ouvre une nouvelle session.`],
-  [120_000, `Contexte au-delà de ${milliers(120_000)} tokens : pour un nouveau chantier, ouvre une nouvelle session.`],
+// Seuils de compactage, du plus haut au plus bas ; chacun une seule fois par conversation :
+// le toast pour l'utilisateur, le rappel pour le cerveau (remis avec son prochain prompt).
+const SEUIL_HAUT = 500_000
+const SEUIL_BAS = 250_000
+
+const conseil = (seuil: number): readonly [number, string, string] => [
+  seuil,
+  `Contexte au-delà de ${milliers(seuil)} tokens : la conversation sera compactée dès que la tâche en cours sera terminée.`,
+  `Note du mod modeles : le contexte de cette conversation dépasse ${milliers(seuil)} tokens. Ne coupe pas la tâche en cours. Dès qu'elle est terminée, note en mémoire les décisions durables, puis appelle l'outil ${OUTIL_COMPACTER} en lui disant ce que le résumé doit garder.`,
 ]
+
+const CONSEILS = [conseil(SEUIL_HAUT), conseil(SEUIL_BAS)] as const
 
 const COMPTE_RENDU = `ce qui est fait, ce qui reste à faire, l'état des fichiers`
 
@@ -147,7 +159,7 @@ Comment tu diriges :
 - N'utilise pas \`fork\` pour exécuter.${
   max === 'fable' ? '' : ` Aucun sous-agent ne tourne au-dessus de toi : un agent demandé sur Fable est ramené à Opus.`
 }
-- Un chantier par conversation : quand un chantier est terminé et que l'utilisateur en commence un autre sans rapport, note en mémoire les décisions utiles et propose-lui d'ouvrir une nouvelle session.
+- Contexte long : quand le mod te signale que le contexte dépasse son seuil, termine d'abord la tâche en cours. Ensuite note en mémoire les décisions durables, puis appelle l'outil \`${OUTIL_COMPACTER}\` en lui disant ce que le résumé doit garder : décisions prises, fichiers touchés, état du travail, reste à faire, consignes de l'utilisateur encore valables. Ne compacte jamais au milieu d'une tâche.
 
 Ce qui te reste permis directement : ${BUDGET_DIRECT} appels entre deux délégations, pour lire, lancer une commande courte ou faire une petite modification de moins de ${TAILLE_MAX_DIRECTE} caractères quand la déléguer coûterait plus cher ; tes notes dans ~/.claude et les fichiers temporaires, sans limite ; les actions sensibles ou irréversibles à garder sous ton contrôle, comme un push. Quand tu pilotes l'écran avec computer-use, Read, Glob, Grep et Bash ne comptent pas dans ce budget pendant 10 minutes après chaque appel ; les modifications restent comptées. Au-delà, le mod refuse l'appel : délègue. L'utilisateur peut lever ces limites avec /delegation off.`
 
@@ -242,6 +254,11 @@ let interactive = true
 let modeleTour: string | undefined
 let ecranTour: boolean | undefined
 const conseilsDonnes = new Set<number>()
+// Le rappel du seuil franchi, remis au cerveau avec son prochain prompt.
+let rappelEnAttente: string | undefined
+// Ce que le cerveau veut que le résumé garde ; le compactage se fait entre deux tours.
+let compactageDemande: string | undefined
+let minuterie: Timer | undefined
 const equipeIds = new Set<string>()
 const nomsEquipe = new Map<string, string>()
 const requetes = new Map<string, number>()
@@ -289,9 +306,57 @@ const estFort = (model: string) => /opus|fable/i.test(model)
 const modeManager = async ($: Session) =>
   (await ecranPresent($)) && estFort(await modelePrincipal($))
 
+type Compactage = 'fait' | 'attente' | { refus: string }
+
+// Compacte la conversation si le cerveau l'a demandé, sans agent en route et entre deux tours.
+// Une demande qui ne peut pas passer reste en attente, pour un autre essai.
+const compacter = async ($: EngineInterface): Promise<Compactage | undefined> => {
+  const instructions = compactageDemande
+  if (instructions === undefined) return undefined
+
+  try {
+    if ((await $.agent.list()).some(a => !TERMINES.has(a.status))) return 'attente'
+  } catch {}
+
+  try {
+    const r = await $.session.compact({ instructions })
+    compactageDemande = undefined
+    if (r.skip !== undefined) {
+      $.ui.toast(`Compactage non fait : ${r.skip}`)
+
+      return { refus: r.skip }
+    }
+    conseilsDonnes.clear()
+    rappelEnAttente = undefined
+    await update($, stats, old => ({ ...old, compactages: old.compactages + 1 }))
+    $.ui.toast(
+      r.tokensBefore !== undefined && r.tokensAfter !== undefined
+        ? `Conversation compactée : ${k(r.tokensBefore)} → ${k(r.tokensAfter)} tokens.`
+        : 'Conversation compactée.',
+    )
+
+    return 'fait'
+  } catch {
+    return 'attente'
+  }
+}
+
+// Pose la minuterie du compactage, s'il n'y en a pas déjà une.
+const planifierCompactage = ($: EngineInterface) => {
+  if (minuterie !== undefined) return
+  minuterie = $.clock.after(DELAI_COMPACTAGE_MS, async () => {
+    minuterie = undefined
+    await compacter($)
+  })
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     conseilsDonnes.clear()
+    rappelEnAttente = undefined
+    compactageDemande = undefined
+    minuterie?.cancel()
+    minuterie = undefined
     interactive = e.isInteractive || e.surface !== null
     modeleTour = undefined
     ecranTour = undefined
@@ -308,8 +373,28 @@ export const register: Register = on => {
     await afficher($)
     await $.command.register({
       name: 'delegation',
-      description: 'Mode manager : état, « on » / « off », ou « effort <niveau> »',
+      description: 'Mode manager : état, « on » / « off », « effort <niveau> » ou « compacter [texte] »',
     })
+    // Un échec ne doit pas empêcher le reste du démarrage.
+    try {
+      await $.tool.register({
+        name: 'compacter',
+        isDeferred: false,
+        description:
+          'Demande le compactage de la conversation à la fin de ce tour. À appeler seulement quand la tâche en cours est terminée et que le contexte est long, jamais au milieu d\'une tâche. Le compactage remplace la conversation par un résumé.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            a_garder: {
+              type: 'string',
+              description:
+                'Ce que le résumé doit conserver : décisions prises, fichiers touchés, état du travail, ce qui reste à faire, consignes de l\'utilisateur encore valables.',
+            },
+          },
+          required: ['a_garder'],
+        },
+      })
+    } catch {}
     for (const agent of EQUIPE) {
       await $.agent.register({ ...agent, tools: [...agent.tools], omitClaudeMd: true })
     }
@@ -397,7 +482,28 @@ export const register: Register = on => {
     return lance
   })
 
+  on('prompt.submit', async ($, e, next) => {
+    const rappel = rappelEnAttente
+    if (rappel === undefined || e.command !== undefined || !(await read($, actif)) || !(await modeManager($))) {
+      return next(e)
+    }
+    rappelEnAttente = undefined
+
+    return next({ ...e, context: [...(e.context ?? []), rappel] })
+  })
+
   on('tool.call', async ($, e, next) => {
+    if (e.tool === OUTIL_COMPACTER) {
+      if (e.agentId !== undefined) return { deny: 'Le compactage se demande depuis le fil principal.' }
+      const aGarder = e.a_garder
+      if (typeof aGarder !== 'string' || aGarder.trim() === '') {
+        return { deny: 'Dis dans a_garder ce que le résumé doit conserver : décisions, fichiers touchés, état du travail, reste à faire.' }
+      }
+      compactageDemande = aGarder
+
+      return { result: "Compactage noté : il se fera à la fin de ce tour, quand aucun agent ne tournera. Termine ta réponse à l'utilisateur et ne lance plus d'agent." }
+    }
+
     if (!(await read($, actif)) || !(await modeManager($))) return next(e)
 
     // L'effort que l'appel Agent demande : agent.spawn le retrouve par le tool_use_id.
@@ -502,13 +608,17 @@ export const register: Register = on => {
     const u = reponse.usage
     const contexte = u ? u.input_tokens + u.cache_creation_input_tokens + u.cache_read_input_tokens : 0
 
-    if (e.agentId === undefined && u) {
+    if (e.agentId === undefined && u && (await read($, actif)) && (await modeManager($))) {
       // Le conseil du seuil le plus haut franchi, une fois ; les seuils plus bas sont tenus pour dits.
       const franchi = CONSEILS.findIndex(([seuil]) => contexte > seuil)
       if (franchi !== -1) {
-        const dejaDit = conseilsDonnes.has(CONSEILS[franchi]![0])
+        const [seuilFranchi, toast, rappel] = CONSEILS[franchi]!
+        const dejaDit = conseilsDonnes.has(seuilFranchi)
         for (const [seuil] of CONSEILS.slice(franchi)) conseilsDonnes.add(seuil)
-        if (!dejaDit) $.ui.toast(CONSEILS[franchi]![1])
+        if (!dejaDit) {
+          $.ui.toast(toast)
+          rappelEnAttente = rappel
+        }
       }
     }
 
@@ -565,7 +675,14 @@ export const register: Register = on => {
     })
     await afficher($)
 
-    return next(e)
+    const fini = await next(e)
+    // Le tour du cerveau est fini : le compactage peut passer, un peu plus tard. Une demande
+    // restée en attente est retentée à la fin du tour suivant.
+    if (e.agentId === undefined && compactageDemande !== undefined && e.reason === 'answer') {
+      planifierCompactage($)
+    }
+
+    return fini
   })
 
   on('prompt.attachment', async ($, e, next) => {
@@ -587,6 +704,15 @@ export const register: Register = on => {
 
   on('command.run', { command: 'delegation' }, async ($, e) => {
     const arg = e.args.trim().toLowerCase()
+
+    const demande = /^compacter(?:\s+([\s\S]*))?$/i.exec(e.args.trim())
+    if (demande) {
+      compactageDemande = demande[1]?.trim() || CONSIGNE_COMPACTAGE
+      // Le moteur refuse $.session.compact depuis un hook de commande : la minuterie le lance après.
+      planifierCompactage($)
+
+      return { text: 'Compactage noté : il se fera dès que le tour en cours et les agents auront fini.' }
+    }
 
     if (arg === 'on' || arg === 'off') {
       await update($, actif, () => arg === 'on')
@@ -619,6 +745,7 @@ export const register: Register = on => {
         `${texteStats(s)} (${s.alleges} allégé(s), ${s.sansModele} appel(s) refusé(s) faute de modèle, ${s.blocages} appel(s) direct(s) refusé(s)).`,
         `Agents de l'équipe : ${s.avertis} avertissement(s), ${s.arretes} arrêt(s). Seuils : ${REQUETES_AVERTISSEMENT_AGENT} puis ${REQUETES_MAX_AGENT} requêtes ; pour Haiku, ${milliers(CONTEXTE_AVERTISSEMENT_HAIKU)} puis ${milliers(CONTEXTE_MAX_HAIKU)} tokens de contexte.`,
         `${texteTokens(s)}.`,
+        `Contexte : ${s.compactages} compactage(s) ; rappel au cerveau à ${milliers(SEUIL_BAS)} puis ${milliers(SEUIL_HAUT)} tokens.`,
         texteCache(s),
         ...(await texteForfait($)),
       ]

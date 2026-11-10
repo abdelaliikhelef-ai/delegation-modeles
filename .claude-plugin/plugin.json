@@ -1,6 +1,6 @@
 {
   "name": "modeles",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Garde Opus ou Fable pour le raisonnement et lui fait choisir le modèle et l'effort de chaque agent qui exécute, de Haiku jusqu'à son propre modèle.",
   "types": "./types/index.d.ts"
 }

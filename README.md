@@ -50,15 +50,20 @@ Un `general-purpose` ou un `Explore` dont la consigne ne nomme ni MCP ni skill e
 - Agents de l'équipe : avertissement à 40 requêtes, arrêt à 80 requêtes.
 - Agents Haiku de l'équipe : avertissement à 70 000 tokens de contexte, arrêt à 95 000. Au-delà de 100 000 tokens de prompt, une requête Haiku 5.5 coûte cinq fois plus cher.
 
-## Conseil de nouvelle session
+## Compactage en fin de tâche
 
-Quand le contexte du fil principal dépasse 120 000 tokens, puis 200 000, le mod affiche une fois un message qui conseille d'ouvrir une nouvelle session pour le chantier suivant.
+Quand le contexte du fil principal dépasse 250 000 tokens, puis 500 000, le mod prévient. L'utilisateur reçoit un message. Le cerveau reçoit un rappel avec son prochain prompt (sauf si c'est une commande slash, le rappel attend alors le prompt suivant).
+
+Quand sa tâche est finie, le cerveau appelle l'outil `mcp__modeles__compacter` et dit ce que le résumé doit garder. Le compactage se fait à la fin du tour, quand aucun agent ne tourne. S'il ne peut pas passer, il est retenté à la fin du tour suivant.
+
+Un compactage est un résumé : il peut perdre un détail. Les décisions durables vont donc en mémoire avant.
 
 ## Commande
 
-- `/delegation` affiche l'état, les agents lancés, les avertissements et arrêts, les tokens par modèle, la part des tokens d'entrée relus depuis le cache, le coût de la session et la part consommée du forfait (fenêtres de 5 heures et de 7 jours).
+- `/delegation` affiche l'état, le nombre de compactages, les agents lancés, les avertissements et arrêts, les tokens par modèle, la part des tokens d'entrée relus depuis le cache, le coût de la session et la part consommée du forfait (fenêtres de 5 heures et de 7 jours).
 - `/delegation on` active le mode, `/delegation off` lève les limites, le routage et le réglage d'effort.
 - `/delegation effort <niveau>` règle l'effort du cerveau.
+- `/delegation compacter [texte]` demande le compactage ; le texte dit ce que le résumé doit garder. Il se fait dès que le tour en cours et les agents ont fini.
 
 ## Quand il ne s'applique pas
 

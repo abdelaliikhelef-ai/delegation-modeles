@@ -12,6 +12,7 @@ const preparer = (on: any, agents: { id: string; status: string }[] = []) => {
   })
   on('session.start', (_: unknown, e: { cwd: string }) => ({ cwd: e.cwd }))
   on('command.register', () => ({ value: { command: 'delegation' } }))
+  on('tool.register', () => ({ value: { tool: 'mcp__modeles__compacter' } }))
   on('agent.register', (_: unknown, e: { name: string }) => ({ value: { agent: e.name } }))
   on('agent.list', () => ({ value: liste.agents }))
   on('turn.step', async function* (_: unknown, e: { turnId: string; index: number }) {
